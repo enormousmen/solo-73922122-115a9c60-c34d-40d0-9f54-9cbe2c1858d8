@@ -7,9 +7,12 @@ Concurrency model
 * Exactly one worker task forms batches and exactly one executor thread runs
   the TorchScript model, therefore at most ONE batch is ever actually
   inferring at any moment.
-* Capacity accounting: an order occupies a slot while it is queued AND while
-  its batch is computing (even if it was cancelled or expired mid-flight).
-  The slot is released only when the batch compute actually finishes.
+* Capacity accounting: an order occupies a slot from the moment it is
+  accepted until it is cancelled/expired while still queued, or — once its
+  batch has started computing — until that batch's compute actually
+  finishes. Orders waiting in the batch-formation window are still queued:
+  they remain in `_pending` (and hence in `capacity_used()`) until the
+  batch actually starts.
 
 State machine per order
 -----------------------
@@ -198,17 +201,23 @@ class BatchEngine:
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            await self._not_empty.wait()
+            # Sleep until there is queued work. The emptiness check and the
+            # event clear happen with no intervening await, and submit()
+            # runs on this same event loop, so no wakeup can be lost.
+            self._purge_expired_pending()
+            if not self._pending:
+                self._not_empty.clear()
+                await self._not_empty.wait()
 
             # Batch-formation window: the idle model waits at most
             # `batch_wait_s` for more work, up to `batch_size` images.
-            batch: list[Order] = []
+            # Orders STAY in `_pending` while the window is open, so
+            # admission control, /stats, cancellation and expiry all keep
+            # seeing them; they leave the queue only when the batch starts.
             window_end = loop.time() + self.batch_wait_s
-            while len(batch) < self.batch_size:
+            while True:
                 self._purge_expired_pending()
-                while self._pending and len(batch) < self.batch_size:
-                    batch.append(self._pending.popleft())
-                if len(batch) >= self.batch_size:
+                if len(self._pending) >= self.batch_size:
                     break
                 remaining = window_end - loop.time()
                 if remaining <= 0:
@@ -217,11 +226,22 @@ class BatchEngine:
                 try:
                     await asyncio.wait_for(self._not_empty.wait(), remaining)
                 except asyncio.TimeoutError:
-                    break
+                    pass  # re-check the queue and the window deadline
 
-            # Final gate: cancelled/expired orders never enter the model.
+            # Final gate: cancelled orders were already removed from
+            # `_pending` by cancel() and expired ones by
+            # _purge_expired_pending() just above, so survivors are
+            # eligible. Pop up to `batch_size` orders — only now do they
+            # stop counting as queued and become in-flight.
+            self._purge_expired_pending()
             now = time.monotonic()
-            batch = [o for o in batch if o.state == QUEUED and o.deadline_at > now]
+            batch: list[Order] = []
+            while self._pending and len(batch) < self.batch_size:
+                o = self._pending.popleft()
+                if o.state == QUEUED and o.deadline_at > now:
+                    batch.append(o)
+                # Anything else was cancelled/expired an instant ago: drop
+                # it; its slot is already released.
             if not batch:
                 continue
 

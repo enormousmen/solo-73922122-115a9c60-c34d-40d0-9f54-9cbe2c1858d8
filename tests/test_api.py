@@ -162,6 +162,73 @@ async def test_capacity_full_rejects_429(make_client):
     assert stats["capacity_used"] == 16
 
 
+async def test_first_submission_counts_while_waiting_for_batch(make_client):
+    """Regression: an order waiting in the batch-formation window must be
+    counted by /stats even though no batch has started yet."""
+    c = await make_client(batch_wait_ms=800)
+    r = await c.submit("sample_gradient.png")
+    assert r.status_code == 201
+    await asyncio.sleep(0.1)  # worker is now inside the formation window
+    stats = (await c.http.get("/stats")).json()
+    assert stats["queued"] == 1
+    assert stats["inflight"] == 0
+    assert stats["capacity_used"] == 1
+
+
+async def test_admission_counts_orders_waiting_in_batch_window(make_client):
+    """Regression: orders waiting for batching occupy capacity, so the
+    (cap+1)-th submission is rejected even while no batch is computing."""
+    c = await make_client(max_capacity=2, batch_wait_ms=800)
+    for i in range(2):
+        r = await c.submit(SAMPLE_NAMES[i % 4])
+        assert r.status_code == 201, (i, r.text)
+    await asyncio.sleep(0.1)  # both orders sit in the formation window
+    r = await c.submit("sample_gradient.png")
+    assert r.status_code == 429, r.text
+    stats = (await c.http.get("/stats")).json()
+    assert stats["capacity_used"] == 2
+    assert stats["queued"] == 2
+
+
+async def test_burst_of_frames_never_exceeds_capacity(make_client):
+    """Cameras bursting frames: exactly 16 accepted, the rest get 429, and
+    /stats never reports more than 16 occupied slots."""
+    c = await make_client(inference_delay_ms=1500)
+    responses = await asyncio.gather(*[c.submit(SAMPLE_NAMES[i % 4]) for i in range(30)])
+    codes = [r.status_code for r in responses]
+    assert codes.count(201) == 16, codes
+    assert codes.count(429) == 14, codes
+    stats = (await c.http.get("/stats")).json()
+    assert stats["capacity_used"] == 16
+    assert stats["capacity_used"] == stats["queued"] + stats["inflight"]
+
+
+async def test_cancel_during_batch_window_releases_slot_and_skips_model(make_client):
+    """A queued order cancelled while the worker is still gathering a batch
+    frees its slot immediately and never enters the model."""
+    c = await make_client(max_capacity=1, batch_wait_ms=800)
+    r = await c.submit("sample_gradient.png")
+    assert r.status_code == 201
+    oid = r.json()["order_id"]
+    await asyncio.sleep(0.1)  # order is waiting inside the formation window
+
+    r = await c.cancel(oid)
+    assert r.status_code == 200
+    assert r.json()["status"] == "cancelled"
+    stats = (await c.http.get("/stats")).json()
+    assert stats["capacity_used"] == 0  # slot released immediately
+
+    # the freed slot can be reused at once
+    r = await c.submit("sample_circles.png")
+    assert r.status_code == 201
+
+    await asyncio.sleep(1.0)  # window long closed; any batch would have run
+    body = await c.get(oid)
+    assert body["status"] == "cancelled"
+    assert body["result"] is None
+    assert body["batch_id"] is None  # never entered the model
+
+
 # --------------------------------------------------------------------- #
 # cancellation
 # --------------------------------------------------------------------- #
